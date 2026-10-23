@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -12,23 +12,25 @@
 <link rel="icon" type="image/png" href="apple-touch-icon.png">
 <title>小猫咪跑酷 · iPad</title>
 <style>
+  :root { --vvx:0px; --vvy:0px; }
   * { margin:0; padding:0; box-sizing:border-box; }
   html, body {
     width:100%; height:100%; overflow:hidden; position:fixed; inset:0;
-    background:#0f172a; overscroll-behavior:none;
+    background:#0f172a; overscroll-behavior:none; touch-action:manipulation;
     font-family:'PingFang SC','Microsoft YaHei',system-ui,sans-serif;
   }
-  canvas { position:fixed; inset:0; display:block; touch-action:none; }
+  /* canvas 是替换元素：必须显式设定 CSS 尺寸，否则 2 倍屏上按内部缓冲区大小显示（只看到左上角） */
+  canvas { position:fixed; left:0; top:0; width:100vw; height:100vh; display:block; touch-action:none; }
   #fsbtn {
-    position:fixed; top:calc(12px + env(safe-area-inset-top)); left:calc(12px + env(safe-area-inset-left));
+    position:fixed; top:calc(12px + env(safe-area-inset-top) + var(--vvy)); left:calc(12px + env(safe-area-inset-left) + var(--vvx));
     width:46px; height:46px; border-radius:50%; border:none;
     background:rgba(15,23,42,0.45); color:#fff; font-size:20px;
     display:none; align-items:center; justify-content:center;
     cursor:pointer; z-index:10; touch-action:manipulation;
   }
   #zoombar {
-    position:fixed; top:calc(15px + env(safe-area-inset-top));
-    left:calc(68px + env(safe-area-inset-left));
+    position:fixed; top:calc(15px + env(safe-area-inset-top) + var(--vvy));
+    left:calc(68px + env(safe-area-inset-left) + var(--vvx));
     display:flex; gap:10px; z-index:10;
   }
   #zoombar button {
@@ -106,14 +108,29 @@ for (let i = 0; i < 6; i++) {
 
 // ---------- 自适应 ----------
 let skyGrad = null;
+let lastVV = '';
 function resize() {
+  const vv = window.visualViewport;
+  const w = vv ? vv.width : window.innerWidth;
+  const h = vv ? vv.height : window.innerHeight;
+  const sc = (vv && vv.scale) || 1;
+  const ox = vv ? vv.offsetLeft : 0, oy = vv ? vv.offsetTop : 0;
+  if (!w || !h || !isFinite(w) || !isFinite(h)) return;   // 视口未就绪时跳过
   const prevGY = GROUND_Y;
-  VW = window.innerWidth;
-  VH = window.innerHeight;
-  if (!VW || !VH || !isFinite(VW) || !isFinite(VH)) return;   // 视口未就绪时跳过
+
+  // 画布与悬浮按钮精确覆盖「看得见的区域」：即使页面被放大/平移也正确铺满
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  canvas.style.left = ox + 'px';
+  canvas.style.top = oy + 'px';
+  document.documentElement.style.setProperty('--vvx', ox + 'px');
+  document.documentElement.style.setProperty('--vvy', oy + 'px');
+
+  VW = Math.round(w * sc);          // 可见宽度×缩放 = 布局像素；视觉大小与页面缩放无关
+  VH = Math.round(h * sc);
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = Math.round(VW * dpr);
-  canvas.height = Math.round(VH * dpr);
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
   S = Math.min(VW / 1000, 1) * userZoom;   // 大屏限倍率 × 用户缩放，加宽可视世界
   WORLD_W = Math.round(VW / S);
   WORLD_H = VH / S;
@@ -137,10 +154,14 @@ function resize() {
     cat.y = GROUND_Y;
   }
   if (VH > VW && state === 'playing') paused = true;   // 转竖屏自动暂停
+  lastVV = w.toFixed(1) + 'x' + h.toFixed(1) + '@' + sc.toFixed(3) + '+' + ox.toFixed(1) + ',' + oy.toFixed(1);
 }
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 100));
-if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', resize);
+  window.visualViewport.addEventListener('scroll', resize);
+}
 resize();
 
 // ---------- 音效 ----------
@@ -774,7 +795,10 @@ function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.05);
   last = now;
   t += dt;
-  if (VW !== window.innerWidth || VH !== window.innerHeight) resize();   // 视口变化自愈
+  const vv = window.visualViewport;   // 视口变化自愈（含页面缩放/平移）
+  const sig = vv ? (vv.width.toFixed(1) + 'x' + vv.height.toFixed(1) + '@' + vv.scale.toFixed(3) + '+' + vv.offsetLeft.toFixed(1) + ',' + vv.offsetTop.toFixed(1))
+                 : (window.innerWidth + 'x' + window.innerHeight);
+  if (sig !== lastVV) resize();
   if (!paused) update(dt);
   render();
   requestAnimationFrame(frame);
