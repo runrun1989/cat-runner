@@ -26,6 +26,16 @@
     display:none; align-items:center; justify-content:center;
     cursor:pointer; z-index:10; touch-action:manipulation;
   }
+  #zoombar {
+    position:fixed; top:calc(15px + env(safe-area-inset-top));
+    left:calc(68px + env(safe-area-inset-left));
+    display:flex; gap:10px; z-index:10;
+  }
+  #zoombar button {
+    width:40px; height:40px; border-radius:50%; border:none;
+    background:rgba(15,23,42,0.45); color:#fff; font-size:20px; line-height:1;
+    cursor:pointer; touch-action:manipulation; -webkit-user-select:none; user-select:none;
+  }
   #rotate {
     display:none; position:fixed; inset:0; z-index:20;
     background:linear-gradient(160deg,#1e293b,#0f172a); color:#e2e8f0;
@@ -40,6 +50,10 @@
 <body>
 <canvas id="game"></canvas>
 <button id="fsbtn" aria-label="全屏" style="display: flex; font-size: 19px">⛶</button>
+<div id="zoombar">
+  <button id="zout" aria-label="缩小画面">－</button>
+  <button id="zin" aria-label="放大画面">＋</button>
+</div>
 <div id="rotate">
   <div class="icon">📱</div>
   <div>请横屏游玩<br><span style="font-size:15px;opacity:.7">旋转 iPad 后即可开始</span></div>
@@ -64,6 +78,8 @@ let state = 'ready';              // ready | playing | over
 let elapsed = 0, dist = 0, speed = 300, scoreF = 0;
 let best = 0;
 try { best = Number(localStorage.getItem('catRunBest') || 0); } catch (e) {}
+let userZoom = 0.8;               // 画面缩放 0.6~1.2，右上角 −/＋ 按钮可调，自动记住
+try { userZoom = Math.min(1.2, Math.max(0.6, Number(localStorage.getItem('catRunZoom')) || 0.8)); } catch (e) {}
 let isNewBest = false;
 let overAt = 0;
 let paused = false;
@@ -91,7 +107,7 @@ function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   canvas.width = Math.round(VW * dpr);
   canvas.height = Math.round(VH * dpr);
-  S = Math.min(VW / 1000, 1);      // 大屏不再放大元素，改为加宽可视世界
+  S = Math.min(VW / 1000, 1) * userZoom;   // 大屏限倍率 × 用户缩放，加宽可视世界
   WORLD_W = Math.round(VW / S);
   WORLD_H = VH / S;
   GROUND_Y = WORLD_H - 64;
@@ -203,6 +219,20 @@ fsbtn.addEventListener('click', (e) => {
     }
   } catch (err) {}
 });
+
+// ---------- 画面缩放按钮（− 缩小 / ＋ 放大，自动记住） ----------
+const zin = document.getElementById('zin');
+const zout = document.getElementById('zout');
+function setZoom(z) {
+  userZoom = Math.min(1.2, Math.max(0.6, Math.round(z * 10) / 10));
+  try { localStorage.setItem('catRunZoom', userZoom); } catch (err) {}
+  resize();
+}
+for (const pair of [[zin, 0.1], [zout, -0.1]]) {
+  const el = pair[0], d = pair[1];
+  el.addEventListener('pointerdown', (e) => e.stopPropagation());
+  el.addEventListener('click', (e) => { e.stopPropagation(); ensureAudio(); setZoom(userZoom + d); });
+}
 
 // ---------- 流程 ----------
 function pressJump() {
