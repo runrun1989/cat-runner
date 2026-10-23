@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="猫咪跑酷">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="apple-touch-icon-precomposed" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" href="apple-touch-icon.png">
+<title>小猫咪跑酷 · iPad</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%; overflow:hidden; position:fixed; inset:0;
+    background:#0f172a; overscroll-behavior:none;
+    font-family:'PingFang SC','Microsoft YaHei',system-ui,sans-serif;
+  }
+  canvas { position:fixed; inset:0; display:block; touch-action:none; }
+  #fsbtn {
+    position:fixed; top:calc(12px + env(safe-area-inset-top)); left:calc(12px + env(safe-area-inset-left));
+    width:46px; height:46px; border-radius:50%; border:none;
+    background:rgba(15,23,42,0.45); color:#fff; font-size:20px;
+    display:none; align-items:center; justify-content:center;
+    cursor:pointer; z-index:10; touch-action:manipulation;
+  }
+  #rotate {
+    display:none; position:fixed; inset:0; z-index:20;
+    background:linear-gradient(160deg,#1e293b,#0f172a); color:#e2e8f0;
+    flex-direction:column; align-items:center; justify-content:center; gap:16px;
+    font-size:22px; letter-spacing:2px; text-align:center;
+  }
+  #rotate .icon { font-size:64px; animation:spin 2s ease-in-out infinite; }
+  @keyframes spin { 0%,100%{transform:rotate(0)} 50%{transform:rotate(90deg)} }
+  @media (orientation: portrait) and (pointer: coarse) { #rotate { display:flex; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="fsbtn" aria-label="全屏">⛶</button>
+<div id="rotate">
+  <div class="icon">📱</div>
+  <div>请横屏游玩<br><span style="font-size:15px;opacity:.7">旋转 iPad 后即可开始</span></div>
+</div>
+
+<script>
+'use strict';
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ---------- 世界坐标：宽度固定 1000，高度随屏幕比例自适应 ----------
+const WORLD_W = 1000;
+let VW = 0, VH = 0, S = 1;        // 视口 CSS 尺寸与缩放系数
+let WORLD_H = 400;
+let GROUND_Y = 336;               // = WORLD_H - 64
+
+const GRAVITY = 2200;
+const CAT_X = 110;
+
+// ---------- 游戏状态 ----------
+let state = 'ready';              // ready | playing | over
+let elapsed = 0, dist = 0, speed = 300, scoreF = 0;
+let best = 0;
+try { best = Number(localStorage.getItem('catRunBest') || 0); } catch (e) {}
+let isNewBest = false;
+let overAt = 0;
+let paused = false;
+let t = 0;
+
+const cat = { y: GROUND_Y, vy: 0, jumps: 0, onGround: true, duck: false, phase: 0, dead: false };
+let obstacles = [];
+let fishes = [];
+let particles = [];
+let floaters = [];
+let nextSpawn = 420;
+
+const clouds = [];
+for (let i = 0; i < 6; i++) {
+  clouds.push({ x: Math.random() * WORLD_W, rel: 0.12 + Math.random() * 0.6, s: 0.6 + Math.random() * 0.8 });
+}
+
+// ---------- 自适应 ----------
+let skyGrad = null;
+function resize() {
+  const prevGY = GROUND_Y;
+  VW = window.innerWidth;
+  VH = window.innerHeight;
+  if (!VW || !VH || !isFinite(VW) || !isFinite(VH)) return;   // 视口未就绪时跳过
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(VW * dpr);
+  canvas.height = Math.round(VH * dpr);
+  S = VW / WORLD_W;
+  WORLD_H = VH / S;
+  GROUND_Y = WORLD_H - 64;
+  ctx.setTransform(dpr * S, 0, 0, dpr * S, 0, 0);
+  skyGrad = null;
+
+  const dh = GROUND_Y - prevGY;
+  if (state === 'playing' || state === 'over') {
+    cat.y += dh;
+    if (cat.y > GROUND_Y) cat.y = GROUND_Y;
+    if (cat.onGround) cat.y = GROUND_Y;
+    for (const o of obstacles) {
+      if (o.type === 'bird') { o.baseY = GROUND_Y - 51; o.y = o.baseY; }
+      else o.y = GROUND_Y - o.h;
+    }
+    for (const f of fishes) f.y += dh;
+    for (const p of particles) p.y += dh;
+    for (const fl of floaters) fl.y += dh;
+  } else {
+    cat.y = GROUND_Y;
+  }
+  if (VH > VW && state === 'playing') paused = true;   // 转竖屏自动暂停
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
+resize();
+
+// ---------- 音效 ----------
+let actx = null;
+function ensureAudio() {
+  if (!actx) {
+    try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  }
+  if (actx && actx.state === 'suspended') actx.resume();
+}
+function beep(f0, f1, dur, type, vol) {
+  if (!actx) return;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, actx.currentTime);
+  o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), actx.currentTime + dur);
+  g.gain.setValueAtTime(vol, actx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + dur);
+  o.connect(g).connect(actx.destination);
+  o.start();
+  o.stop(actx.currentTime + dur + 0.02);
+}
+
+// ---------- 输入：键盘 ----------
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+    e.preventDefault();
+    if (!e.repeat) pressJump();
+  } else if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+    e.preventDefault();
+    cat.duck = true;
+  } else if (e.code === 'KeyP') {
+    paused = !paused;
+  }
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'ArrowDown' || e.code === 'KeyS') cat.duck = false;
+});
+
+// ---------- 输入：触屏（点按=跳，下滑=低头） ----------
+let touchId = null, touchStartY = 0, touchDuck = false;
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  ensureAudio();
+  if (touchId === null) { touchId = e.pointerId; touchStartY = e.clientY; touchDuck = false; }
+  pressJump();
+});
+window.addEventListener('pointermove', (e) => {
+  if (e.pointerId === touchId && e.clientY - touchStartY > 36) {
+    cat.duck = true;
+    touchDuck = true;
+  }
+});
+function endTouch(e) {
+  if (e.pointerId === touchId || e.type === 'pointercancel') {
+    touchId = null;
+    if (touchDuck) { cat.duck = false; touchDuck = false; }
+  }
+}
+window.addEventListener('pointerup', endTouch);
+window.addEventListener('pointercancel', endTouch);
+
+// 阻止 iOS 页面滚动 / 双击缩放 / 捏合
+document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+document.addEventListener('dblclick', (e) => e.preventDefault());
+
+// ---------- 全屏按钮 ----------
+const fsbtn = document.getElementById('fsbtn');
+const isStandalone = (navigator.standalone === true) || window.matchMedia('(display-mode: standalone)').matches;
+if (!isStandalone) fsbtn.style.display = 'flex';
+fsbtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+fsbtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  try {
+    const el = document.documentElement;
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+      const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+      if (fn) fn.call(el);
+    } else {
+      const fn = document.exitFullscreen || document.webkitExitFullscreen;
+      if (fn) fn.call(document);
+    }
+  } catch (err) {}
+});
+
+// ---------- 流程 ----------
+function pressJump() {
+  ensureAudio();
+  if (paused) { paused = false; return; }
+  if (state === 'ready') { startGame(); return; }
+  if (state === 'over') {
+    if (performance.now() - overAt > 400) resetAndStart();
+    return;
+  }
+  if (cat.onGround || cat.jumps < 2) {
+    cat.vy = cat.jumps === 0 ? -760 : -640;
+    cat.jumps++;
+    cat.onGround = false;
+    beep(cat.jumps === 1 ? 320 : 430, cat.jumps === 1 ? 520 : 680, 0.09, 'square', 0.04);
+    spawnDust();
+  }
+}
+function startGame() { state = 'playing'; }
+function resetAndStart() {
+  state = 'playing';
+  elapsed = 0; dist = 0; speed = 300; scoreF = 0;
+  obstacles = []; fishes = []; particles = []; floaters = [];
+  cat.y = GROUND_Y; cat.vy = 0; cat.jumps = 0; cat.onGround = true; cat.dead = false;
+  nextSpawn = 420;
+  isNewBest = false;
+}
+function gameOver() {
+  state = 'over';
+  overAt = performance.now();
+  cat.dead = true;
+  const sc = Math.floor(scoreF);
+  if (sc > best) {
+    best = sc;
+    isNewBest = true;
+    try { localStorage.setItem('catRunBest', best); } catch (e) {}
+  }
+  beep(220, 60, 0.35, 'sawtooth', 0.06);
+  for (let k = 0; k < 14; k++) {
+    particles.push({
+      x: CAT_X + 30, y: cat.y - 24,
+      vx: (Math.random() - 0.5) * 300, vy: -Math.random() * 260,
+      life: 0.6 + Math.random() * 0.4, color: '#f97316'
+    });
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'playing') paused = true;
+});
+
+// ---------- 生成障碍 / 小鱼 ----------
+function spawnObstacle() {
+  const x = WORLD_W + 40;
+  const r = Math.random();
+  let o;
+  if (scoreF > 120 && r < 0.22) {
+    o = { type: 'bird', x, w: 46, h: 26, baseY: GROUND_Y - 51, bob: Math.random() * 6 };
+    o.y = o.baseY;
+  } else if (r < 0.42) {
+    const w = 44 + Math.random() * 16, h = 42 + Math.random() * 12;
+    o = { type: 'box', x, w, h, y: GROUND_Y - h };
+  } else if (r < 0.55) {
+    o = { type: 'box2', x, w: 88, h: 44, y: GROUND_Y - 44 };
+  } else if (r < 0.8) {
+    const h = 52 + Math.random() * 14;
+    o = { type: 'cactus', x, w: 26, h, y: GROUND_Y - h };
+  } else {
+    o = { type: 'box', x, w: 44, h: 42, y: GROUND_Y - 42 };
+  }
+  obstacles.push(o);
+
+  const gap = 240 + speed * 0.5 + Math.random() * 240;
+  if (Math.random() < 0.55) {
+    fishes.push({ x: x + o.w + gap * 0.5, y: GROUND_Y - (60 + Math.random() * 70), bob: Math.random() * 6 });
+  }
+  nextSpawn = o.w + gap;
+}
+
+// ---------- 碰撞 ----------
+function rectHit(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+function catBox() {
+  const ducking = cat.duck && cat.onGround;
+  const h = ducking ? 26 : 46;
+  const w = ducking ? 74 : 56;
+  return { x: CAT_X + 6, y: cat.y - h + 3, w: w - 12, h: h - 4 };
+}
+function obstacleBox(o) {
+  if (o.type === 'bird') return { x: o.x + 6, y: o.y + 6, w: o.w - 12, h: o.h - 10 };
+  return { x: o.x + 4, y: o.y + 3, w: o.w - 8, h: o.h - 5 };
+}
+
+// ---------- 粒子 ----------
+function spawnDust() {
+  for (let k = 0; k < 5; k++) {
+    particles.push({
+      x: CAT_X + 18 + Math.random() * 20, y: GROUND_Y - 2,
+      vx: -40 - Math.random() * 60, vy: -30 - Math.random() * 60,
+      life: 0.35 + Math.random() * 0.2, color: '#d9c9a8'
+    });
+  }
+}
+
+// ---------- 更新 ----------
+function update(dt) {
+  for (const c of clouds) {
+    c.x -= (state === 'playing' ? speed * 0.25 : 12) * dt * c.s;
+    if (c.x < -120) {
+      c.x = WORLD_W + 120;
+      c.rel = 0.12 + Math.random() * 0.6;
+    }
+  }
+  for (const p of particles) {
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 600 * dt; p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+  for (const f of floaters) { f.y -= 40 * dt; f.life -= dt; }
+  floaters = floaters.filter(f => f.life > 0);
+
+  if (state !== 'playing') return;
+
+  elapsed += dt;
+  speed = Math.min(700, 300 + elapsed * 4.5);
+  dist += speed * dt;
+  scoreF += speed * dt / 30;
+  cat.phase += speed * dt * 0.05;
+
+  const g = GRAVITY * ((!cat.onGround && cat.duck) ? 2.6 : 1);
+  cat.vy += g * dt;
+  cat.y += cat.vy * dt;
+  if (cat.y >= GROUND_Y) {
+    if (!cat.onGround) spawnDust();
+    cat.y = GROUND_Y; cat.vy = 0; cat.jumps = 0; cat.onGround = true;
+  } else {
+    cat.onGround = false;
+  }
+
+  nextSpawn -= speed * dt;
+  if (nextSpawn <= 0) spawnObstacle();
+
+  for (const o of obstacles) {
+    o.x -= speed * dt;
+    if (o.type === 'bird') { o.x -= 50 * dt; o.bob += dt * 5; }
+  }
+  obstacles = obstacles.filter(o => o.x + o.w > -60);
+
+  for (const f of fishes) { f.x -= speed * dt; f.bob += dt * 3; }
+  fishes = fishes.filter(f => f.x > -40);
+
+  const cb = catBox();
+  for (let i = fishes.length - 1; i >= 0; i--) {
+    const f = fishes[i];
+    const fb = { x: f.x - 14, y: f.y - 10 + Math.sin(f.bob) * 4, w: 28, h: 20 };
+    if (rectHit(cb, fb)) {
+      fishes.splice(i, 1);
+      scoreF += 5;
+      floaters.push({ x: f.x, y: f.y - 20, txt: '+5', life: 0.9 });
+      for (let k = 0; k < 8; k++) {
+        particles.push({
+          x: f.x, y: f.y,
+          vx: (Math.random() - 0.5) * 160, vy: -Math.random() * 180,
+          life: 0.5 + Math.random() * 0.3, color: '#fbbf24'
+        });
+      }
+      beep(880, 1500, 0.12, 'sine', 0.05);
+    }
+  }
+
+  for (const o of obstacles) {
+    if (rectHit(cb, obstacleBox(o))) { gameOver(); break; }
+  }
+}
+
+// ---------- 绘制工具 ----------
+function rrFill(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+function drawX(cx, cy, s) {
+  ctx.beginPath();
+  ctx.moveTo(cx - s, cy - s); ctx.lineTo(cx + s, cy + s);
+  ctx.moveTo(cx + s, cy - s); ctx.lineTo(cx - s, cy + s);
+  ctx.stroke();
+}
+
+// ---------- 场景 ----------
+function drawSky() {
+  if (!isFinite(GROUND_Y) || GROUND_Y <= 0) return;
+  if (!skyGrad) {
+    skyGrad = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    skyGrad.addColorStop(0, '#8ed8f8');
+    skyGrad.addColorStop(0.7, '#c8ecfb');
+    skyGrad.addColorStop(1, '#fdf3d8');
+  }
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, WORLD_W, GROUND_Y + 2);
+}
+function drawSun() {
+  const sy = GROUND_Y * 0.22;
+  ctx.fillStyle = 'rgba(253,224,71,0.35)';
+  ctx.beginPath(); ctx.arc(WORLD_W - 110, sy, 52, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fcd34d';
+  ctx.beginPath(); ctx.arc(WORLD_W - 110, sy, 34, 0, Math.PI * 2); ctx.fill();
+}
+function drawClouds() {
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  for (const c of clouds) {
+    const cy = 20 + c.rel * (GROUND_Y - 160);
+    ctx.beginPath();
+    ctx.arc(c.x, cy, 18 * c.s, 0, Math.PI * 2);
+    ctx.arc(c.x + 20 * c.s, cy - 8 * c.s, 22 * c.s, 0, Math.PI * 2);
+    ctx.arc(c.x + 44 * c.s, cy, 16 * c.s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(c.x - 10 * c.s, cy, 62 * c.s, 14 * c.s);
+  }
+}
+function drawHills() {
+  const off1 = (dist * 0.15) % 300, off2 = (dist * 0.3) % 220;
+  ctx.fillStyle = '#a7dd8f';
+  for (let i = -1; i < WORLD_W / 300 + 2; i++) {
+    ctx.beginPath();
+    ctx.arc(i * 300 - off1 + 150, GROUND_Y + 30, 110, Math.PI, 0);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#8ccf73';
+  for (let i = -1; i < WORLD_W / 220 + 2; i++) {
+    ctx.beginPath();
+    ctx.arc(i * 220 - off2 + 80, GROUND_Y + 34, 80, Math.PI, 0);
+    ctx.fill();
+  }
+}
+function drawGround() {
+  ctx.fillStyle = '#e6c893';
+  ctx.fillRect(0, GROUND_Y, WORLD_W, WORLD_H - GROUND_Y + 4);
+  ctx.fillStyle = '#7cc65e';
+  ctx.fillRect(0, GROUND_Y, WORLD_W, 12);
+  ctx.fillStyle = '#5eae47';
+  ctx.fillRect(0, GROUND_Y + 9, WORLD_W, 3);
+  const off = dist % 80;
+  ctx.fillStyle = 'rgba(180,140,90,0.5)';
+  for (let i = -1; i < WORLD_W / 80 + 2; i++) {
+    const x = i * 80 - off + 20;
+    ctx.beginPath(); ctx.ellipse(x, GROUND_Y + 30, 7, 3, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + 40, GROUND_Y + 46, 5, 2.5, 0, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ---------- 障碍绘制 ----------
+function drawBox(x, y, w, h) {
+  ctx.fillStyle = '#c88b4a';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#a06530';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(x + 1.5, y + 1.5, w - 3, h - 3);
+  ctx.fillStyle = '#e8c394';
+  ctx.fillRect(x + w / 2 - 5, y + 2, 10, h - 4);
+}
+function drawCactus(o) {
+  const gy = GROUND_Y;
+  ctx.fillStyle = '#c96a3e';
+  ctx.beginPath();
+  ctx.moveTo(o.x - 2, gy - 16); ctx.lineTo(o.x + 28, gy - 16);
+  ctx.lineTo(o.x + 24, gy); ctx.lineTo(o.x + 2, gy);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#b55730';
+  ctx.fillRect(o.x - 3, gy - 19, 32, 5);
+  ctx.fillStyle = '#4fae55';
+  rrFill(o.x + 2, gy - o.h, 22, o.h - 14, 10);
+  rrFill(o.x - 8, gy - o.h + 14, 10, 16, 5);
+  rrFill(o.x - 8, gy - o.h + 24, 16, 8, 4);
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(o.x + 8, gy - o.h + 10); ctx.lineTo(o.x + 8, gy - o.h + 20);
+  ctx.moveTo(o.x + 17, gy - o.h + 16); ctx.lineTo(o.x + 17, gy - o.h + 26);
+  ctx.stroke();
+}
+function drawBird(o) {
+  const y = o.y + Math.sin(o.bob) * 5;
+  ctx.fillStyle = '#4b5563';
+  ctx.beginPath(); ctx.ellipse(o.x + 24, y + 14, 20, 11, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(o.x + 40, y + 12); ctx.lineTo(o.x + 52, y + 6); ctx.lineTo(o.x + 50, y + 16);
+  ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(o.x + 8, y + 10, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#f59e0b';
+  ctx.beginPath();
+  ctx.moveTo(o.x + 2, y + 8); ctx.lineTo(o.x - 7, y + 11); ctx.lineTo(o.x + 2, y + 14);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(o.x + 8, y + 8, 2.6, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(o.x + 7, y + 8, 1.3, 0, Math.PI * 2); ctx.fill();
+  const wingY = Math.sin(o.bob * 2) * 7;
+  ctx.fillStyle = '#374151';
+  ctx.beginPath();
+  ctx.moveTo(o.x + 16, y + 8);
+  ctx.lineTo(o.x + 32, y + 2 - wingY);
+  ctx.lineTo(o.x + 32, y + 14);
+  ctx.closePath(); ctx.fill();
+}
+function drawFish(f) {
+  const fy = f.y + Math.sin(f.bob) * 4;
+  ctx.save();
+  ctx.translate(f.x, fy);
+  ctx.fillStyle = '#fbbf24';
+  ctx.beginPath(); ctx.ellipse(0, 0, 13, 8, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-10, 0); ctx.lineTo(-20, -7); ctx.lineTo(-20, 7);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#f59e0b';
+  ctx.beginPath(); ctx.ellipse(0, -2, 6, 4, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(7, -2, 3, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(8, -2, 1.5, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+function drawObstacle(o) {
+  if (o.type === 'box') drawBox(o.x, GROUND_Y - o.h, o.w, o.h);
+  else if (o.type === 'box2') { drawBox(o.x, GROUND_Y - o.h, 42, o.h); drawBox(o.x + 46, GROUND_Y - o.h, 42, o.h); }
+  else if (o.type === 'cactus') drawCactus(o);
+  else if (o.type === 'bird') drawBird(o);
+}
+
+// ---------- 猫咪绘制 ----------
+function drawCat() {
+  const ducking = cat.duck && cat.onGround;
+  const x = CAT_X, yb = cat.y;
+  const legH = ducking ? 6 : 10;
+  const bodyH = ducking ? 16 : 26;
+  const bodyW = ducking ? 70 : 54;
+  const bodyTop = yb - legH - bodyH;
+
+  const airH = GROUND_Y - cat.y;
+  const sr = Math.max(0.4, 1 - airH / 200);
+  ctx.fillStyle = 'rgba(0,0,0,0.15)';
+  ctx.beginPath();
+  ctx.ellipse(CAT_X + 28, GROUND_Y + 7, 30 * sr, 6 * sr, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const tw = Math.sin(t * 8) * 6;
+  ctx.strokeStyle = '#f5a623';
+  ctx.lineWidth = 7;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x + 4, bodyTop + bodyH - 4);
+  ctx.quadraticCurveTo(x - 16, bodyTop - 6 + tw, x - 6, bodyTop - 18 + tw);
+  ctx.stroke();
+  ctx.strokeStyle = '#d9821f';
+  ctx.beginPath();
+  ctx.moveTo(x - 6, bodyTop - 18 + tw);
+  ctx.lineTo(x - 2, bodyTop - 23 + tw);
+  ctx.stroke();
+
+  ctx.fillStyle = '#e8940f';
+  if (!cat.onGround) {
+    rrFill(x + 8, yb - legH - 2, 7, legH, 3);
+    rrFill(x + bodyW - 18, yb - legH - 2, 7, legH, 3);
+  } else {
+    for (let i = 0; i < 4; i++) {
+      const lx = x + 6 + i * ((bodyW - 18) / 3);
+      const sw = Math.sin(cat.phase + (i % 2) * Math.PI) * (ducking ? 2 : 4);
+      rrFill(lx + sw, yb - legH - 2, 7, legH + 2, 3);
+    }
+  }
+
+  ctx.fillStyle = '#f5a623';
+  rrFill(x, bodyTop, bodyW, bodyH, 12);
+  ctx.fillStyle = '#ffe9c8';
+  rrFill(x + 10, bodyTop + bodyH - 9, bodyW - 24, 8, 4);
+  ctx.fillStyle = '#d9821f';
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.ellipse(x + 10 + i * 12, bodyTop + 3, 4, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const hx = ducking ? x + bodyW - 2 : x + bodyW - 4;
+  const hy = ducking ? yb - legH - bodyH + 4 : bodyTop + 2;
+  const hr = ducking ? 12 : 14;
+  ctx.fillStyle = '#f5a623';
+  ctx.beginPath();
+  ctx.moveTo(hx - 10, hy - hr + 3); ctx.lineTo(hx - 8, hy - hr - 9); ctx.lineTo(hx - 1, hy - hr + 1);
+  ctx.closePath(); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(hx + 2, hy - hr + 1); ctx.lineTo(hx + 8, hy - hr - 8); ctx.lineTo(hx + 12, hy - hr + 2);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#f7b7a3';
+  ctx.beginPath();
+  ctx.moveTo(hx - 8.5, hy - hr + 2); ctx.lineTo(hx - 7.5, hy - hr - 5); ctx.lineTo(hx - 3, hy - hr + 0.5);
+  ctx.closePath(); ctx.fill();
+
+  ctx.fillStyle = '#f5a623';
+  ctx.beginPath(); ctx.arc(hx, hy, hr, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#d9821f';
+  ctx.beginPath(); ctx.ellipse(hx - 4, hy - hr + 4, 2.5, 4, 0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(hx + 3, hy - hr + 3, 2.5, 4, -0.3, 0, Math.PI * 2); ctx.fill();
+
+  if (cat.dead) {
+    ctx.strokeStyle = '#7c2d12';
+    ctx.lineWidth = 2;
+    drawX(hx + 4, hy - 3, 4);
+    ctx.beginPath();
+    ctx.moveTo(hx + hr - 4, hy + 5); ctx.lineTo(hx + hr + 2, hy + 7);
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(hx + 5, hy - 3, 4.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#111';
+    ctx.beginPath(); ctx.arc(hx + 6.5, hy - 3, 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#f472b6';
+    ctx.beginPath();
+    ctx.moveTo(hx + hr - 2, hy + 1); ctx.lineTo(hx + hr + 3, hy + 2.5); ctx.lineTo(hx + hr - 2, hy + 4);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(90,60,30,0.75)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(hx + hr - 1, hy + 3); ctx.lineTo(hx + hr + 10, hy + 0);
+    ctx.moveTo(hx + hr - 1, hy + 4); ctx.lineTo(hx + hr + 10, hy + 5);
+    ctx.moveTo(hx - 2, hy + 4); ctx.lineTo(hx - 12, hy + 1);
+    ctx.moveTo(hx - 2, hy + 5); ctx.lineTo(hx - 12, hy + 7);
+    ctx.stroke();
+  }
+}
+
+// ---------- UI ----------
+function drawUI() {
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#1e3a5f';
+  ctx.font = 'bold 20px "PingFang SC", system-ui, sans-serif';
+  ctx.fillText('得分 ' + Math.floor(scoreF), WORLD_W - 24, 36);
+  ctx.font = '14px "PingFang SC", system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(30,58,95,0.75)';
+  ctx.fillText('最高 ' + best, WORLD_W - 24, 58);
+  ctx.textAlign = 'left';
+}
+function drawOverlays() {
+  ctx.textAlign = 'center';
+  const cx = WORLD_W / 2;
+  if (state === 'ready') {
+    ctx.fillStyle = '#1e3a5f';
+    ctx.font = 'bold 46px "PingFang SC", system-ui, sans-serif';
+    ctx.fillText('🐱 小猫咪跑酷', cx, GROUND_Y * 0.38);
+    const bob = Math.sin(t * 3) * 4;
+    ctx.font = '20px "PingFang SC", system-ui, sans-serif';
+    ctx.fillStyle = '#334e68';
+    ctx.fillText('点击屏幕 / 空格 开始', cx, GROUND_Y * 0.55 + bob);
+    ctx.font = '16px "PingFang SC", system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(51,78,104,0.8)';
+    ctx.fillText('再点一次二段跳 · 往下滑动低头躲小鸟 · 吃小鱼干加分', cx, GROUND_Y * 0.65 + bob);
+  }
+  if (state === 'over') {
+    ctx.fillStyle = 'rgba(255,255,255,0.72)';
+    ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+    ctx.fillStyle = '#b91c1c';
+    ctx.font = 'bold 46px "PingFang SC", system-ui, sans-serif';
+    ctx.fillText('游戏结束', cx, GROUND_Y * 0.35);
+    ctx.fillStyle = '#1e3a5f';
+    ctx.font = 'bold 26px "PingFang SC", system-ui, sans-serif';
+    ctx.fillText('得分 ' + Math.floor(scoreF) + (isNewBest ? '  🎉 新纪录！' : ''), cx, GROUND_Y * 0.48);
+    ctx.fillStyle = '#334e68';
+    ctx.font = '18px "PingFang SC", system-ui, sans-serif';
+    ctx.fillText('点击屏幕 / 空格 再来一局', cx, GROUND_Y * 0.6 + Math.sin(t * 3) * 3);
+  }
+  if (paused) {
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+    ctx.fillStyle = '#1e3a5f';
+    ctx.font = 'bold 36px "PingFang SC", system-ui, sans-serif';
+    ctx.fillText('已暂停 — 点击屏幕继续', cx, WORLD_H / 2);
+  }
+  ctx.textAlign = 'left';
+}
+
+// ---------- 渲染 ----------
+function render() {
+  drawSky();
+  drawSun();
+  drawClouds();
+  drawHills();
+  drawGround();
+  for (const f of fishes) drawFish(f);
+  for (const o of obstacles) drawObstacle(o);
+  drawCat();
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life * 2);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.font = 'bold 18px "PingFang SC", system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  for (const f of floaters) {
+    ctx.globalAlpha = Math.max(0, f.life);
+    ctx.fillStyle = '#b45309';
+    ctx.fillText(f.txt, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+  drawUI();
+  drawOverlays();
+}
+
+// ---------- 主循环 ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  t += dt;
+  if (VW !== window.innerWidth || VH !== window.innerHeight) resize();   // 视口变化自愈
+  if (!paused) update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
