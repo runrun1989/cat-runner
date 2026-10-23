@@ -39,7 +39,7 @@
 </head>
 <body>
 <canvas id="game"></canvas>
-<button id="fsbtn" aria-label="全屏">⛶</button>
+<button id="fsbtn" aria-label="全屏" style="display: flex; font-size: 19px">⛶</button>
 <div id="rotate">
   <div class="icon">📱</div>
   <div>请横屏游玩<br><span style="font-size:15px;opacity:.7">旋转 iPad 后即可开始</span></div>
@@ -51,7 +51,7 @@ const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
 // ---------- 世界坐标：宽度固定 1000，高度随屏幕比例自适应 ----------
-const WORLD_W = 1000;
+let WORLD_W = 1000;               // 设计宽度 1000；宽屏下自动加宽可视范围，元素不随屏幕放大
 let VW = 0, VH = 0, S = 1;        // 视口 CSS 尺寸与缩放系数
 let WORLD_H = 400;
 let GROUND_Y = 336;               // = WORLD_H - 64
@@ -78,7 +78,7 @@ let nextSpawn = 420;
 
 const clouds = [];
 for (let i = 0; i < 6; i++) {
-  clouds.push({ x: Math.random() * WORLD_W, rel: 0.12 + Math.random() * 0.6, s: 0.6 + Math.random() * 0.8 });
+  clouds.push({ x: Math.random() * 1400, rel: 0.12 + Math.random() * 0.6, s: 0.6 + Math.random() * 0.8 });
 }
 
 // ---------- 自适应 ----------
@@ -91,7 +91,8 @@ function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   canvas.width = Math.round(VW * dpr);
   canvas.height = Math.round(VH * dpr);
-  S = VW / WORLD_W;
+  S = Math.min(VW / 1000, 1);      // 大屏不再放大元素，改为加宽可视世界
+  WORLD_W = Math.round(VW / S);
   WORLD_H = VH / S;
   GROUND_Y = WORLD_H - 64;
   ctx.setTransform(dpr * S, 0, 0, dpr * S, 0, 0);
